@@ -1,0 +1,118 @@
+LOCAL VERIFICATION — 2026-09-23 (UTC)
+Résumé issu des commandes réellement exécutées ; transcript complet conservé localement.
+Le port 3000 étant occupé, override temporaire sur 127.0.0.1:13000.
+L’application, les tests et docker-compose.yml sont inchangés.
+
+Override utilisé :
+services:
+  app:
+    ports: !override
+      - "127.0.0.1:13000:3000"
+
+Démarrage réussi : docker compose -p hbtn-pipeline-lab -f docker-compose.yml -f <override> up -d
+
+$ docker compose ps -a
+NAME      IMAGE     COMMAND   SERVICE   CREATED   STATUS    PORTS
+
+Exit code: 0
+
+Port conflict resolution: existing node process PID 50555 owns 127.0.0.1:3000. It was not stopped.
+Temporary Compose override <override> changes only the published host port to 127.0.0.1:13000; source project remains unchanged.
+services:
+  app:
+    ports: !override
+      - "127.0.0.1:13000:3000"
+
+$ docker compose -p hbtn-pipeline-lab -f docker-compose.yml -f <override> ps
+NAME                      IMAGE                   COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+hbtn-pipeline-lab-app-1   hbtn-pipeline-lab-app   "docker-entrypoint.s…"   app       24 seconds ago   Up 18 seconds             127.0.0.1:13000->3000/tcp
+hbtn-pipeline-lab-db-1    postgres:16-alpine      "docker-entrypoint.s…"   db        24 seconds ago   Up 23 seconds (healthy)   5432/tcp
+
+Exit code: 0
+
+$ docker compose -p hbtn-pipeline-lab -f docker-compose.yml -f <override> run --rm app npm run test:unit
+ Container hbtn-pipeline-lab-db-1 Running
+ Container hbtn-pipeline-lab-db-1 Waiting
+ Container hbtn-pipeline-lab-db-1 Healthy
+ Container hbtn-pipeline-lab-app-run-756d178cd556 Creating
+ Container hbtn-pipeline-lab-app-run-756d178cd556 Created
+
+> hbtn-devops-pipeline-lab@1.0.0 test:unit
+> jest --runInBand tests/unit
+
+PASS tests/unit/items.unit.test.js
+PASS tests/unit/health.test.js
+
+Test Suites: 2 passed, 2 total
+Tests:       8 passed, 8 total
+Snapshots:   0 total
+Time:        0.311 s
+Ran all test suites matching tests/unit.
+
+Exit code: 0
+
+$ docker compose -p hbtn-pipeline-lab -f docker-compose.yml -f <override> run --rm app npm run test:integration
+ Container hbtn-pipeline-lab-db-1 Running
+ Container hbtn-pipeline-lab-db-1 Waiting
+ Container hbtn-pipeline-lab-db-1 Healthy
+ Container hbtn-pipeline-lab-app-run-699f1c32a11e Creating
+ Container hbtn-pipeline-lab-app-run-699f1c32a11e Created
+
+> hbtn-devops-pipeline-lab@1.0.0 test:integration
+> jest --runInBand tests/integration
+
+PASS tests/integration/items.int.test.js
+
+Test Suites: 1 passed, 1 total
+Tests:       3 passed, 3 total
+Snapshots:   0 total
+Time:        0.28 s
+Ran all test suites matching tests/integration.
+
+Exit code: 0
+
+$ curl --fail --silent --show-error --include http://localhost:13000/health
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 15
+ETag: W/"f-VaSQ4oDUiZblZNAEkkN+sX+q3Sg"
+Date: Wed, 23 Sep 2026 07:36:54 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+{"status":"ok"}
+Exit code: 0
+
+$ docker compose -p hbtn-pipeline-lab -f docker-compose.yml -f <override> down -v
+ Container hbtn-pipeline-lab-app-1 Stopping
+ Container hbtn-pipeline-lab-app-1 Stopped
+ Container hbtn-pipeline-lab-app-1 Removing
+ Container hbtn-pipeline-lab-app-1 Removed
+ Container hbtn-pipeline-lab-db-1 Stopping
+ Container hbtn-pipeline-lab-db-1 Stopped
+ Container hbtn-pipeline-lab-db-1 Removing
+ Container hbtn-pipeline-lab-db-1 Removed
+ Volume hbtn-pipeline-lab_db-data Removing
+ Network hbtn-pipeline-lab_default Removing
+ Volume hbtn-pipeline-lab_db-data Removed
+ Network hbtn-pipeline-lab_default Removed
+
+Exit code: 0
+
+$ docker compose -p hbtn-pipeline-lab -f docker-compose.yml -f <override> ps -a
+NAME      IMAGE     COMMAND   SERVICE   CREATED   STATUS    PORTS
+
+Exit code: 0
+
+$ docker volume ls --filter label=com.docker.compose.project=hbtn-pipeline-lab
+DRIVER    VOLUME NAME
+
+Exit code: 0
+
+$ docker network ls --filter label=com.docker.compose.project=hbtn-pipeline-lab
+NETWORK ID   NAME      DRIVER    SCOPE
+
+Exit code: 0
+
+Result: PASS. Unit tests 8/8; integration tests 3/3; /health HTTP 200. Both project containers, project volume, and project network removed by scoped compose down -v.

@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+# Serialize each branch so releases cannot race to update latest or staging.
+concurrency:
+  group: pipeline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test:
     name: Test
@@ -73,7 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
-          path: reports/
+          path: ./reports/
           retention-days: 7
 
   build:
@@ -116,3 +121,152 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy staging
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions: {}
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      STAGING_URL: ${{ vars.STAGING_URL }}
+    steps:
+      - name: Validate configuration and trigger the SHA deployment
+        id: start
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in RENDER_API_KEY RENDER_SERVICE_ID STAGING_URL; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "::error::Missing staging configuration: $variable"
+              exit 1
+            fi
+          done
+          if [[ ! "$STAGING_URL" =~ ^https://[^/?#[:space:]]+/?$ ]]; then
+            echo "::error::STAGING_URL must be an HTTPS origin without a path or query."
+            exit 1
+          fi
+          if [[ ! "$RENDER_SERVICE_ID" =~ ^srv-[a-z0-9]+$ ]]; then
+            echo "::error::Invalid RENDER_SERVICE_ID format."
+            exit 1
+          fi
+
+          image_url="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          payload=$(jq -nc --arg image "$image_url" \
+            '{imageUrl: $image, clearCache: "do_not_clear"}')
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
+
+          # Do not retry this POST: an uncertain response could create duplicates.
+          if ! http_status=$(curl --silent --output "$response_file" \
+            --write-out '%{http_code}' --connect-timeout 5 --max-time 30 \
+            --request POST \
+            --header "Authorization: Bearer $RENDER_API_KEY" \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys"); then
+            echo "::error::Render deploy request failed; check Render before retrying."
+            exit 1
+          fi
+          if [[ "$http_status" != 201 && "$http_status" != 202 ]]; then
+            echo "::error::Render rejected the deploy request (HTTP $http_status)."
+            exit 1
+          fi
+          if ! deploy_id=$(jq -er \
+            '.id | select(type == "string" and test("^dep-[a-z0-9]+$"))' \
+            "$response_file" 2>/dev/null); then
+            echo "::error::Render returned no trackable deploy ID (HTTP $http_status). A queued deploy may still run; inspect Render before retrying."
+            exit 1
+          fi
+          echo "deploy_id=$deploy_id" >> "$GITHUB_OUTPUT"
+          echo "image_url=$image_url" >> "$GITHUB_OUTPUT"
+          echo "Render deployment $deploy_id: requested"
+
+      - name: Wait for the exact Render deployment
+        env:
+          DEPLOY_ID: ${{ steps.start.outputs.deploy_id }}
+          EXPECTED_IMAGE: ${{ steps.start.outputs.image_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
+
+          # At most 60 requests: 10 seconds per request plus a 5-second pause.
+          for attempt in {1..60}; do
+            if ! http_status=$(curl --silent --output "$response_file" \
+              --write-out '%{http_code}' --connect-timeout 5 --max-time 10 \
+              --header "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys/$DEPLOY_ID"); then
+              http_status=000
+            fi
+            if [[ "$http_status" == 200 ]]; then
+              if ! jq -e --arg id "$DEPLOY_ID" '.id == $id' \
+                "$response_file" >/dev/null 2>&1; then
+                echo "::error::Render returned an invalid or different deployment."
+                exit 1
+              fi
+              status=$(jq -r '.status // "unknown"' "$response_file")
+              case "$status" in
+                live)
+                  if ! jq -e --arg image "$EXPECTED_IMAGE" '.image.ref == $image' \
+                    "$response_file" >/dev/null 2>&1; then
+                    echo "::error::The live deployment does not match the expected SHA image."
+                    exit 1
+                  fi
+                  echo "Render deployment $DEPLOY_ID: live"
+                  exit 0
+                  ;;
+                build_failed|update_failed|pre_deploy_failed|canceled|deactivated)
+                  echo "::error::Render deployment $DEPLOY_ID: $status"
+                  exit 1
+                  ;;
+                created|queued|build_in_progress|update_in_progress|pre_deploy_in_progress)
+                  echo "Render deployment $DEPLOY_ID: $status"
+                  ;;
+                *)
+                  echo "::error::Render returned an unsupported deployment status."
+                  exit 1
+                  ;;
+              esac
+            elif [[ "$http_status" == 000 || "$http_status" == 429 || "$http_status" =~ ^5[0-9][0-9]$ ]]; then
+              echo "Render polling: transient HTTP $http_status ($attempt/60)"
+            else
+              echo "::error::Render polling failed (HTTP $http_status)."
+              exit 1
+            fi
+            if (( attempt < 60 )); then sleep 5; fi
+          done
+          echo "::error::Render deployment did not become live within the polling limit."
+          exit 1
+
+      - name: Verify health and database access over HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="${STAGING_URL%/}"
+          failed=0
+          for endpoint in health items; do
+            passed=0
+            for attempt in {1..12}; do
+              if ! http_status=$(curl --silent --output /dev/null \
+                --write-out '%{http_code}' --connect-timeout 5 --max-time 10 \
+                --header 'Cache-Control: no-cache' "$base_url/$endpoint"); then
+                http_status=000
+              fi
+              echo "/$endpoint: HTTP $http_status ($attempt/12)"
+              if [[ "$http_status" == 200 ]]; then
+                passed=1
+                break
+              fi
+              if (( attempt < 12 )); then sleep 5; fi
+            done
+            if (( passed == 0 )); then
+              echo "::error::/$endpoint did not return HTTP 200 within the retry limit."
+              failed=1
+            fi
+          done
+          exit "$failed"
