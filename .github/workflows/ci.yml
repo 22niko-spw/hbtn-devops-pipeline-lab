@@ -27,6 +27,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      # Disposable CI database; these are not staging credentials.
+      DATABASE_URL: postgres://pipeline:pipeline@localhost:5432/pipeline
 
     services:
       postgres:
